@@ -1,2 +1,2 @@
 # bridge-flood-early-warning-system
-![bridge warning](./images/bridge_rainfall.gif)
+![bridge warning](./images/bridge_warnings.gif)
