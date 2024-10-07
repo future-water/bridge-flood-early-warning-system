@@ -1,2 +1,2 @@
 # bridge-flood-early-warning-system
-![bridge warning](./images/bridge_warnings.gif)
+<img src="./images/bridge_warnings.gif" alt="bridge warning" width="500"/>
