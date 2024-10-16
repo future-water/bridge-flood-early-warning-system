@@ -2,8 +2,10 @@ import os
 import copy
 import asyncio
 import logging
+import multiprocessing as mp
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 import scipy.linalg
-from scipy.sparse import csr_matrix, lil_matrix, eye, csgraph
+from scipy.sparse import lil_matrix, csgraph
 from scipy.optimize import root_scalar
 import numpy as np
 import pandas as pd
@@ -14,22 +16,18 @@ from nutils import interpolate_sample
 
 logger = logging.getLogger(__name__)
 
+PROCESSES = mp.cpu_count() - 1
 MIN_SLOPE = 1e-8
 
 class MuskingumCunge:
     def __init__(self, json, init_o_t=None, init_P_t=None, dt=3600.0,
-                 t_0=0.0, json_type='old', create_state_space=True, 
-                 sparse=False, verbose=False):
+                 t_0=0.0, create_state_space=True, sparse=False, verbose=False):
         self.verbose = verbose
         self.sparse = sparse
         self.callbacks = {}
-        assert isinstance(json, dict)
         # Read json input file
-        if json_type == 'old':
-            self.read_json_file(json)
-            self.read_hydraulic_geometry(json)
-        else:
-            self.read_nhd_file(json)
+        assert isinstance(json, dict)
+        self.read_nhd_file(json)
         # Construct network topology
         self.construct_network()
         # Create parameter arrays
@@ -58,23 +56,6 @@ class MuskingumCunge:
             np.add.at(self.i_t_prev, self.endnodes, self.o_t_prev)
             self.i_t_next = np.zeros(len(self.o_t_next))
             np.add.at(self.i_t_next, self.endnodes, self.o_t_next)
-        if init_P_t is None:
-            if self.sparse:
-                self.P_t_next = 1e-3 * eye(n)
-                self.P_t_prev = 1e-3 * eye(n)
-            else:
-                self.P_t_next = 1e-3 * np.eye(n)
-                self.P_t_prev = 1e-3 * np.eye(n)
-        else:
-            if self.sparse:
-                raise NotImplementedError
-            else:
-                assert isinstance(init_P_t, np.ndarray)
-                assert init_P_t.ndim == 2
-                assert init_P_t.shape[0] == n
-                assert init_P_t.shape[1] == n
-                self.P_t_prev = init_P_t.copy()
-                self.P_t_next = init_P_t.copy()
         # Initialize state-space matrices
         if sparse:
             A = lil_matrix((n, n))
@@ -89,15 +70,11 @@ class MuskingumCunge:
         self.dt = dt
         self.timedelta = timedelta
         self.saved_states = {}
-        if json_type == 'old':
-            self.compute_normal_depth(self.o_t_prev)
-            self.compute_hydraulic_geometry(self.h)
-            self.compute_K_and_X(self.h, self.o_t_prev)
-        else:
-            self.K = np.zeros(n, dtype=np.float64)
-            self.X = np.zeros(n, dtype=np.float64)
-            self.K[:] = 3600.
-            self.X[:] = 0.29
+        self.K = np.zeros(n, dtype=np.float64)
+        self.X = np.zeros(n, dtype=np.float64)
+        # TODO: Should allow these to be set
+        self.K[:] = 3600.
+        self.X[:] = 0.29
         self.compute_muskingum_coeffs()
         if create_state_space:
             self.create_state_space()
@@ -105,7 +82,7 @@ class MuskingumCunge:
 
     def read_nhd_file(self, d):
         if self.verbose:
-            print('Reading NHD file...')
+            logger.info('Reading NHD file...')
         node_ids = [i['attributes']['COMID'] for i in d['features']]
         link_ids = [i['attributes']['COMID'] for i in d['features']]
         paths = [np.asarray(i['geometry']['paths']) for i in d['features']]
@@ -121,41 +98,8 @@ class MuskingumCunge:
         self.dx = dx
         self.paths = paths
 
-    def read_json_file(self, d):
-        if self.verbose:
-            print('Reading JSON file...')
-        node_ids = [i["uid"] for i in d["nodes"]]
-        link_ids = [i["uid"] for i in d["links"]]
-        reach_ids = [link_id[2:] for link_id in link_ids]
-        source_node_ids = [i["source_uid"] for i in d["links"]]
-        target_node_ids = [i["target_uid"] for i in d["links"]]
-        dx = np.asarray([i["length"] for i in d["links"]])
-        # So = np.asarray([i['user_metadata']['Slope'] for i in d['links']])
-        K = np.asarray(
-            [i["hydrologic_routing"]["muskingum_station"]["k"] for i in d["links"]]
-        )
-        X = np.asarray(
-            [i["hydrologic_routing"]["muskingum_station"]["x"] for i in d["links"]]
-        )
-        mann_n = np.asarray(
-            [
-                i["hydrologic_routing"]["muskingum_cunge_station"]["roughness"]
-                for i in d["links"]
-            ]
-        )
-        self.reach_ids = reach_ids
-        self.node_ids = node_ids
-        self.source_node_ids = source_node_ids
-        self.target_node_ids = target_node_ids
-        self.dx = dx
-        # self.So = So
-        self.K = K
-        self.X = X
-        self.mann_n = mann_n
-        # TODO: See if paths can be extracted
-        self.paths = []
-
     def read_hydraulic_geometry(self, d):
+        raise NotImplementedError
         source_node_ids = self.source_node_ids
         target_node_ids = self.target_node_ids
         # Set trapezoidal geometry
@@ -195,7 +139,7 @@ class MuskingumCunge:
 
     def construct_network(self):
         if self.verbose:
-            print('Constructing network...')
+            logger.info('Constructing network...')
         # NOTE: node_ids and source_node_ids should always be the same for NHD
         # But not necessarily so for original json files
         node_ids = self.node_ids
@@ -367,6 +311,17 @@ class MuskingumCunge:
                 endnode = endnodes[startnode]
         return A, B
 
+    def init_states(self, o_t_next=None, i_t_next=None):
+        if o_t_next is None:
+            self.o_t_next[:] = 0.
+        else:
+            self.o_t_next[:] = o_t_next[:]
+        if i_t_next is None:
+            self.i_t_next[:] = 0.
+            np.add.at(self.i_t_next, self.endnodes, self.o_t_next[self.endnodes])
+        else:
+            self.i_t_next[:] = i_t_next[:]
+
     def step(self, p_t_next, num_iter=1, inc_t=False):
         raise NotImplementedError
         A = self.A
@@ -414,6 +369,7 @@ class MuskingumCunge:
             callback.__on_step_end__()
 
     def propagate_uncertainty(self, Q_cov: np.ndarray, inc_t=False):
+        raise NotImplementedError
         A = self.A
         dt = self.dt
         timedelta = self.timedelta
@@ -426,6 +382,7 @@ class MuskingumCunge:
             self.datetime += self.timedelta
 
     def propagate_uncertainty_iter(self, Q_cov: np.ndarray, inc_t=False):
+        raise NotImplementedError
         dt = self.dt
         timedelta = self.timedelta
         startnodes = self.startnodes
@@ -447,6 +404,7 @@ class MuskingumCunge:
             self.datetime += self.timedelta
 
     def time_update(self):
+        raise NotImplementedError
         dt = self.dt
         self.t += dt
         self.datetime += self.timedelta
@@ -488,7 +446,6 @@ class MuskingumCunge:
         self.saved_states["datetime"] = self.datetime
         self.saved_states["i_t_next"] = self.i_t_next.copy()
         self.saved_states["o_t_next"] = self.o_t_next.copy()
-        self.saved_states["P_t_next"] = self.P_t_next.copy()
         for _, callback in self.callbacks.items():
             callback.__on_save_state__()
 
@@ -498,7 +455,6 @@ class MuskingumCunge:
         self.datetime = self.saved_states["datetime"]
         self.i_t_next = self.saved_states["i_t_next"]
         self.o_t_next = self.saved_states["o_t_next"]
-        self.P_t_next = self.saved_states["P_t_next"]
         for _, callback in self.callbacks.items():
             callback.__on_load_state__()
 
@@ -582,8 +538,6 @@ class MuskingumCunge:
             sub_model.i_t_prev = self.i_t_prev[sub_index_map]
             sub_model.o_t_next = self.o_t_next[sub_index_map]
             sub_model.i_t_next = self.i_t_next[sub_index_map]
-            sub_model.P_t_prev = 1e-3 * np.eye(sub_model.n)
-            sub_model.P_t_next = 1e-3 * np.eye(sub_model.n)
             sub_model.paths = [self.paths[i] for i in sub_index_map]
             if create_state_space:
                 sub_model.create_state_space()
@@ -624,7 +578,6 @@ def _Q(h, Q, B, z, mann_n, So):
     Q = (np.sqrt(So) / mann_n) * A ** (5 / 3) / P ** (2 / 3)
     return Q
 
-
 def _dQ_dh(h, Q, B, z, mann_n, So):
     num_0 = 5 * np.sqrt(So) * (h * (B + h * z)) ** (2 / 3) * (B + 2 * h * z)
     den_0 = 3 * mann_n * (B + 2 * h * np.sqrt(z + 1)) ** (2 / 3)
@@ -639,9 +592,6 @@ class BaseCallback():
     def __init__(self, *args, **kwargs):
         pass
 
-    def __on_step__(self):
-        return None
-    
     def __on_step_start__(self):
         return None
     
@@ -661,11 +611,6 @@ class BaseCallback():
         return None
 
 
-class Simulation():
-    def __init__(self, model_collection):
-        self.model_collection = model_collection
-
-
 class ModelCollection():
     def __init__(self, model_dict, outer_startnodes, outer_endnodes, startnode_indices, endnode_indices):
         self.components = model_dict
@@ -680,7 +625,6 @@ class ModelCollection():
         self.entry_nodes = {index : model_dict[index]['entry_node'] for index in model_dict}
         self.node_map = {index : model_dict[index]['node_map'] for index in model_dict}
         self.inputs = {index : model_dict[index]['input'] for index in model_dict}
-        self.outputs = {}
 
     def load_states(self):
         for key in self.models:
@@ -689,6 +633,21 @@ class ModelCollection():
     def save_states(self):
         for key in self.models:
             self.models[key].save_state()
+
+
+class Simulation():
+    def __init__(self, model_collection):
+        self.model_collection = model_collection
+        self.outer_startnodes = model_collection.outer_startnodes
+        self.outer_endnodes = model_collection.outer_endnodes
+        self.outer_indegree = model_collection.outer_indegree
+        self._indegree = model_collection._indegree
+        self.models = model_collection.models
+        self.terminal_nodes = model_collection.terminal_nodes
+        self.entry_nodes = model_collection.entry_nodes
+        self.node_map = model_collection.node_map
+        self.inputs = model_collection.inputs
+        self.outputs = {}
 
     def simulate(self):
         outer_startnodes = self.outer_startnodes
@@ -724,7 +683,7 @@ class ModelCollection():
                     reach_id_out = model_start.reach_ids[index_out]
                     reach_id_in = model_end.reach_ids[index_in]
                     i_t_prev = outputs[reach_id_out].shift(1).iloc[1:].fillna(0.)
-                    i_t_next = outputs[reach_id_out].iloc[1:]
+                    i_t_next = outputs[reach_id_out].iloc[1:].fillna(0.)
                     gamma_in = model_end.gamma[index_in]
                     alpha_in = model_end.alpha[index_in]
                     beta_in = model_end.beta[index_in]
@@ -741,7 +700,11 @@ class ModelCollection():
                     break
         return multi_outputs
 
-    async def simulate_async(self, verbose=False):
+class AsyncSimulation(Simulation):
+    def __init__(self, model_collection):
+        return super().__init__(model_collection)
+    
+    async def simulate(self, verbose=False):
         indegree = self.outer_indegree.copy()
         indegree[self.outer_endnodes == self.outer_startnodes] -= 1
         self._indegree = indegree
@@ -757,7 +720,7 @@ class ModelCollection():
             asyncio.run(self._main(verbose=verbose))
         return self.outputs
 
-    async def _main(self, checkpoint=datetime.timedelta(seconds=3600), verbose=False):
+    async def _main(self, verbose=False):
         indegree = self._indegree
         async with asyncio.TaskGroup() as taskgroup:
             for index, predecessors in enumerate(indegree):
@@ -766,31 +729,25 @@ class ModelCollection():
                     inputs = self.inputs[index]
                     taskgroup.create_task(self._simulate(taskgroup, model,
                                                          inputs, index, 
-                                                         checkpoint, verbose))
+                                                         verbose))
 
-    async def _simulate(self, taskgroup, model, inputs, index,
-     checkpoint=datetime.timedelta(seconds=3600), verbose=False):
+    async def _simulate(self, taskgroup, model, inputs, index, verbose=False):
         if verbose:
             print(f'Started job for sub-watershed {index}')
         start_time = model.datetime
-        model_saved = False
         outputs = {}
         outputs[start_time] = model.o_t_next
         for state in model.simulate_iter(inputs, inc_t=True):
             current_time = state.datetime
-            if (current_time - start_time >= checkpoint) and (not model_saved):
-                model.save_state()
-                model_saved = True
             o_t_next = state.o_t_next
             outputs[current_time] = o_t_next
         outputs = pd.DataFrame.from_dict(outputs, orient='index')
         outputs.index = pd.to_datetime(outputs.index, utc=True)
         outputs.columns = inputs.columns
         self.outputs[index] = outputs
-        taskgroup.create_task(self._accumulate(taskgroup, outputs, index, checkpoint, verbose))
+        taskgroup.create_task(self._accumulate(taskgroup, outputs, index, verbose))
 
-    async def _accumulate(self, taskgroup, outputs, index, 
-    checkpoint=datetime.timedelta(seconds=3600), verbose=False):
+    async def _accumulate(self, taskgroup, outputs, index, verbose=False):
         indegree = self._indegree
         startnode = index
         endnode = self.outer_endnodes[startnode]
@@ -814,18 +771,134 @@ class ModelCollection():
             indegree[endnode] -= 1
             if (indegree[endnode] == 0):
                 taskgroup.create_task(self._simulate(taskgroup, model_end,
-                                                     inputs, endnode, 
-                                                     checkpoint, verbose))
+                                                     inputs, endnode, verbose))
         if verbose:
             print(f'Finished job for sub-watershed {index}')
 
+class MultiThreadedSimulation(AsyncSimulation):
+    def __init__(self, model_collection, max_workers=None):
+        super().__init__(model_collection)
+        self.max_workers = max_workers
+        self.executor = ThreadPoolExecutor(max_workers)
+
+    async def simulate(self, verbose=False):
+        indegree = self.outer_indegree.copy()
+        indegree[self.outer_endnodes == self.outer_startnodes] -= 1
+        self._indegree = indegree
+        m = len(self.models)
+        try:
+            loop = asyncio.get_running_loop()
+            self.loop = loop
+            loop_running = True
+        except RuntimeError:
+            loop_running = False
+            raise
+        await self._main(verbose=verbose)
+        self.flush_executor()
+        return self.outputs
+    
+    async def _main(self, verbose=False):
+        indegree = self._indegree
+        async with asyncio.TaskGroup() as taskgroup:
+            for index, predecessors in enumerate(indegree):
+                if predecessors == 0:
+                    model = self.models[index]
+                    inputs = self.inputs[index]
+                    taskgroup.create_task(self._simulate(taskgroup, model,
+                                                         inputs, index,
+                                                         verbose))
+
+    async def _simulate(self, taskgroup, model, inputs, index, loop, verbose=False):
+        if verbose:
+            print(f'Started job for sub-watershed {index}')
+        executor = self.executor
+        loop = self.loop
+        outputs, model_post = await loop.run_in_executor(executor, _inner_simulation,
+                                                         model, inputs)
+        self.outputs[index] = outputs
+        model.saved_states.update(model_post.saved_states)
+        taskgroup.create_task(self._accumulate(taskgroup, outputs, index, verbose))
+
+    def flush_executor(self):
+        self.executor.shutdown()
+        self.executor = ThreadPoolExecutor(self.max_workers)
+
+class MultiProcessSimulation(MultiThreadedSimulation):
+    def __init__(self, model_collection, max_workers=None):
+        super().__init__(model_collection)
+        self.max_workers = max_workers
+        self.executor = ProcessPoolExecutor(max_workers)
+
+    def flush_executor(self):
+        self.executor.shutdown()
+        self.executor = ProcessPoolExecutor(self.max_workers)
+
+
+def _inner_simulation(model, inputs):
+    start_time = model.datetime
+    outputs = {}
+    outputs[start_time] = model.o_t_next
+    for state in model.simulate_iter(inputs, inc_t=True):
+        current_time = state.datetime
+        o_t_next = state.o_t_next
+        outputs[current_time] = o_t_next
+    outputs = pd.DataFrame.from_dict(outputs, orient='index')
+    outputs.index = pd.to_datetime(outputs.index, utc=True)
+    outputs.columns = inputs.columns
+    return outputs, model
+
+
+class CheckPoint(BaseCallback):
+    def __init__(self, model, checkpoint_time=None, timedelta=None):
+        self.model = model
+        if checkpoint_time is None:
+            if timedelta is None:
+                raise ValueError('Either `checkpoint_time` or `timedelta` must not be `None`.')
+            else:
+                checkpoint_time = model.datetime + datetime.timedelta(seconds=timedelta)
+        self.checkpoint_time = checkpoint_time
+        self.timedelta = timedelta
+        self.model_saved = False
+
+    def __on_simulation_start__(self):
+        timedelta = self.timedelta
+        if timedelta is None:
+            return None
+        else:
+            checkpoint_time = self.model.datetime + datetime.timedelta(seconds=timedelta)
+            self.set_checkpoint(checkpoint_time)
+    
+    def __on_step_end__(self):
+        checkpoint_time = self.checkpoint_time
+        current_time = self.model.datetime
+        if (current_time >= checkpoint_time) and (not self.model_saved):
+            self.model.save_state()
+            self.model_saved = True
+
+    def __on_save_state__(self):
+        model = self.model
+        for _, callback in model.callbacks.items():
+            if hasattr(callback, 'save_state'):
+                callback.save_state()
+
+    def __on_load_state__(self):
+        model = self.model
+        for _, callback in model.callbacks.items():
+            if hasattr(callback, 'load_state'):
+                callback.load_state()
+    
+    def set_checkpoint(self, checkpoint_time):
+        self.checkpoint_time = checkpoint_time
+        self.model_saved = False
+
 
 class KalmanFilter(BaseCallback):
-    def __init__(self, model, measurements, Q_cov, R_cov):
+    def __init__(self, model, measurements, Q_cov, R_cov, P_t_init):
         self.model = model
         self.measurements = measurements
         self.Q_cov = Q_cov
         self.R_cov = R_cov
+        self.P_t_next = P_t_init
         self.reach_ids = model.reach_ids
         self.gage_reach_ids = measurements.columns
         self.datetime = copy.deepcopy(model.datetime)
@@ -850,7 +923,18 @@ class KalmanFilter(BaseCallback):
         self.measurements = self.measurements.iloc[:, permutations]
         self.R_cov = self.R_cov[permutations, :][:, permutations]
 
-    def __on_step_start__(self):
+        self.saved_states = {}
+        self.save_state()
+
+    def __on_simulation_start__(self):
+        return None
+        # TODO: Double-check for off-by-one error
+        if self.model.datetime > self.latest_timestamp:
+            return None
+        else:
+            return self.filter()
+
+    def __on_step_end__(self):
         # TODO: Double-check for off-by-one error
         if self.model.datetime > self.latest_timestamp:
             return None
@@ -877,9 +961,17 @@ class KalmanFilter(BaseCallback):
             raise ValueError
         return interpolate_sample(datetime, datetimes, samples, method=method_code)
 
+    def save_state(self):
+        self.saved_states["datetime"] = self.datetime
+        self.saved_states["P_t_next"] = self.P_t_next.copy()
+
+    def load_state(self):
+        self.datetime = self.saved_states["datetime"]
+        self.P_t_next = self.saved_states["P_t_next"]
+
     def filter(self):
         # Implements KF after step is called
-        P_t_prev = self.model.P_t_next
+        P_t_prev = self.P_t_next
         i_t_next = self.model.i_t_next
         o_t_next = self.model.o_t_next
         Q_cov = self.Q_cov
@@ -914,10 +1006,10 @@ class KalmanFilter(BaseCallback):
         # Save posterior estimates
         self.model.i_t_next = i_t_next
         self.model.o_t_next = o_t_next        
-        self.model.P_t_prev = P_t_prev
-        self.model.P_t_next = P_t_next
+        self.P_t_next = P_t_next
         # Update time
         self.datetime = datetime
+
 
 class KalmanSmoother(KalmanFilter):
     def __init__(self, model, measurements, Q_cov, R_cov):
@@ -940,7 +1032,7 @@ class KalmanSmoother(KalmanFilter):
         self.i_hat_s = None
         self.o_hat_s = None
 
-    def __on_step_start__(self):
+    def __on_step_end__(self):
         # TODO: Double-check for off-by-one error
         if self.model.datetime > self.latest_timestamp:
             return None
