@@ -2,7 +2,7 @@ import numpy as np
 
 from scipy import special, integrate, stats
 
-from _utils import move_axis_to_end, argsort_indices, suppress_warnings
+# from _utils import move_axis_to_end, argsort_indices, suppress_warnings
 
 
 # The normalization constant for the univariate standard Gaussian pdf
