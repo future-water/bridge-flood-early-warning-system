@@ -210,3 +210,39 @@ def prepare_data_for_plotting(diff_da, diff_raw):
                                      var_name='Skill Type', value_name='Skill Value')
     melted_data['Index'] = melted_data['Index'] + 1
     return melted_data
+
+def calculate_ensemble_weights_and_flows(date_range, site_output_da, obs_cms, multi_models):
+    ensemble_weights_history = {}
+    weighted_flows = {}
+
+    for date_index, date in enumerate(date_range):
+        weighted_flows[date] = {}
+        time_range = site_output_da[date][multi_models[0]].index
+
+        weighted_flow = {}
+        ensemble_weights = np.ones(len(multi_models))
+
+        if date_index > 0:
+            for i, model in enumerate(multi_models):
+                ground_truth = obs_cms[site_output_da[date_range[date_index - 1]][model].index[1]]
+                overtop_flow_values = np.array([site_output_da[date_range[date_index - 1]][model].iloc[1]])
+                combined_values = overtop_flow_values
+
+                for n in range(2, 19):
+                    if date_index >= n:
+                        additional_point = np.array([site_output_da[date_range[date_index - n]][model].iloc[n]])
+                        combined_values = np.concatenate((combined_values, additional_point))
+
+                mse = np.mean((combined_values - ground_truth)**2)
+                ensemble_weights[i] = 1 / (mse + 1e-6)
+
+        ensemble_weights /= np.sum(ensemble_weights)
+        ensemble_weights_history[date] = ensemble_weights.copy()
+
+        for timestamp in time_range:
+            overtop_flow_values = np.array([site_output_da[date][model][timestamp] for model in multi_models])
+            weighted_flow[timestamp] = np.sum(overtop_flow_values * ensemble_weights)
+
+        weighted_flows[date] = pd.Series(weighted_flow)
+
+    return ensemble_weights_history, weighted_flows
