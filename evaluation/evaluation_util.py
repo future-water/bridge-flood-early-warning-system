@@ -1,6 +1,8 @@
 import numpy as np
 import pandas as pd
 from _crps import crps_ensemble
+import matplotlib.pyplot as plt
+from matplotlib.patches import Patch
 
 def brier_score(forecast_probs, actual_outcomes):
     N = len(forecast_probs)
@@ -11,6 +13,17 @@ def NSE(predicted, observed):
     numerator = np.sum((observed - predicted) ** 2)
     denominator = np.sum((observed - mean_observed) ** 2)
     return 1 - (numerator / denominator) if denominator != 0 else float('inf')
+
+def KGE(predicted, observed):
+    # Correlation component
+    r = np.corrcoef(predicted, observed)[0, 1]
+    # Variability component
+    alpha = np.std(predicted) / np.std(observed)
+    # Bias component
+    beta = np.mean(predicted) / np.mean(observed)
+    # Calculate KGE
+    kge = 1 - np.sqrt((r - 1)**2 + (alpha - 1)**2 + (beta - 1)**2)
+    return kge
 
 def calculate_rmse(predictions, observations):
     valid_data = pd.DataFrame({'predictions': predictions, 'observations': observations}).dropna()
@@ -30,10 +43,22 @@ def load_and_prepare_usgs(file_path, gauges_usgs):
     
     return usgs, rename_dict
 
-def sensitivity(site, factor, raw, all_outputs_open, all_outputs_da, usgs, date_range, multi_models):
+def sensitivity(site, factor, raw, all_outputs_open, all_outputs_da, usgs, date_range, multi_models, bridge_info, use_bridge_data=True):
+    available_comids = set(bridge_data['comid'] for bridge_data in bridge_info.values())
+    overflow_values = []
     obs_cms = usgs[site]
-    overtop_flow = max(obs_cms) * factor
-    # print(f"Overtop flow threshold: {overtop_flow}")
+    
+    if use_bridge_data and bridge_info:
+        # Look for bridge overflow values
+        for bridge_id, bridge_data in bridge_info.items():
+            if bridge_data['comid'] == site:
+                overflow_val = bridge_data['overflow'][0] if len(bridge_data['overflow']) > 0 else float('inf')
+                if overflow_val >= 1:
+                    overflow_values.append(overflow_val)
+        
+        overtop_flow = min(overflow_values) if overflow_values else max(obs_cms) * factor
+    else:
+        overtop_flow = max(obs_cms) * factor
 
     raw_flow = {}
     for date in date_range:
@@ -127,6 +152,14 @@ def sensitivity(site, factor, raw, all_outputs_open, all_outputs_da, usgs, date_
     crps_das = {}
     crps_opens = {}
 
+    nse_raws = {}
+    nse_das = {}
+    nse_opens = {}
+    
+    kge_raws = {}
+    kge_das = {}
+    kge_opens = {}
+
     for hour in range(1, 13):
 
         def mean_first_12_hours(row):
@@ -168,6 +201,18 @@ def sensitivity(site, factor, raw, all_outputs_open, all_outputs_da, usgs, date_
         timelagged_raw_probs[hour] = timelagged_raw_prob
         timelagged_open_probs[hour] = timelagged_open_prob
 
+        valid_indices_raw = timelagged_raw.dropna().index.intersection(obs_all.index)
+        valid_indices_da = timelagged_da.dropna().index.intersection(obs_all.index)
+        valid_indices_open = timelagged_open.dropna().index.intersection(obs_all.index)
+
+        nse_raw = NSE(timelagged_raw.loc[valid_indices_raw], obs_all.loc[valid_indices_raw])
+        nse_da = NSE(timelagged_da.loc[valid_indices_da], obs_all.loc[valid_indices_da])
+        nse_open = NSE(timelagged_open.loc[valid_indices_open], obs_all.loc[valid_indices_open])
+        
+        kge_raw = KGE(timelagged_raw.loc[valid_indices_raw].values, obs_all.loc[valid_indices_raw].values)
+        kge_da = KGE(timelagged_da.loc[valid_indices_da].values, obs_all.loc[valid_indices_da].values)
+        kge_open = KGE(timelagged_open.loc[valid_indices_open].values, obs_all.loc[valid_indices_open].values)
+
         brier_raws[hour] = brier_raw
         brier_das[hour] = brier_da
         brier_opens[hour] = brier_open
@@ -175,8 +220,22 @@ def sensitivity(site, factor, raw, all_outputs_open, all_outputs_da, usgs, date_
         crps_raws[hour] = crps_raw
         crps_das[hour] = crps_da
         crps_opens[hour] = crps_open
+
+        nse_raws[hour] = nse_raw
+        nse_das[hour] = nse_da
+        nse_opens[hour] = nse_open
+        
+        kge_raws[hour] = kge_raw
+        kge_das[hour] = kge_da
+        kge_opens[hour] = kge_open
     
-    return ensemble_weights_history, overtop_flow, timelagged_das, timelagged_raws, timelagged_opens, crps_das, crps_raws, crps_opens, timelagged_da_probs, timelagged_raw_probs, timelagged_open_probs, brier_raws, brier_das, brier_opens  
+    return (ensemble_weights_history, overtop_flow, 
+            timelagged_das, timelagged_raws, timelagged_opens, 
+            crps_das, crps_raws, crps_opens, 
+            timelagged_da_probs, timelagged_raw_probs, timelagged_open_probs, 
+            brier_raws, brier_das, brier_opens,
+            nse_raws, nse_das, nse_opens,
+            kge_raws, kge_das, kge_opens)
 
 def calculate_diff(results, gage_list, key_da, key_raw, epsilon=1e-6):
     diff = {}
@@ -246,3 +305,70 @@ def calculate_ensemble_weights_and_flows(date_range, site_output_da, obs_cms, mu
         weighted_flows[date] = pd.Series(weighted_flow)
 
     return ensemble_weights_history, weighted_flows
+
+def create_boxplot_figure(metric_name, raw_data, da_data):
+    fig, ax = plt.subplots(figsize=(10, 6))
+    colors = {'Raw': plt.cm.tab10.colors[1], 'DA': plt.cm.tab10.colors[0]}
+    
+    offsets = [-0.15, 0.15]
+    box_width = 0.25
+    
+    medians_raw = []
+    medians_da = []
+    
+    for lt in range(1, 13):
+        raw_values = raw_data[lt]
+        da_values = da_data[lt]
+        
+        bp_raw = ax.boxplot([raw_values], positions=[lt + offsets[0]], 
+                           widths=box_width, patch_artist=True)
+        bp_da = ax.boxplot([da_values], positions=[lt + offsets[1]], 
+                         widths=box_width, patch_artist=True)
+    
+        for box in bp_raw['boxes']:
+            box.set(facecolor=colors['Raw'], alpha=0.5)
+            box.set(edgecolor=colors['Raw'])
+        for box in bp_da['boxes']:
+            box.set(facecolor=colors['DA'], alpha=0.5)
+            box.set(edgecolor=colors['DA'])
+
+        for whisker in bp_raw['whiskers'] + bp_da['whiskers']:
+            whisker.set(color='gray', linewidth=1)
+  
+        for median in bp_raw['medians']:
+            median.set(color='white', linewidth=1)
+            medians_raw.append(np.median(raw_values) if raw_values else np.nan)
+            
+        for median in bp_da['medians']:
+            median.set(color='white', linewidth=1)
+            medians_da.append(np.median(da_values) if da_values else np.nan)
+    
+    lead_times = list(range(1, 13))
+    plt.plot([x + offsets[0] for x in lead_times], medians_raw, '-', color=colors['Raw'], 
+             linewidth=2, alpha=1)
+    plt.plot([x + offsets[1] for x in lead_times], medians_da, '-', color=colors['DA'], 
+             linewidth=2, alpha=1)
+    
+    ax.axhline(y=0, color='black', linestyle='--', alpha=0.5)
+    
+    ax.set_xlabel('Lead Time (hr)', fontsize=16)
+    ax.set_ylabel(f'{metric_name}', fontsize=16)
+    ax.set_xticks(lead_times)
+    ax.set_xticklabels([str(lt) for lt in lead_times], fontsize=14)
+
+    ax.set_ylim(-1.5, 1.0)
+    yticks = np.arange(-1.5, 1.1, 0.5)
+    ax.set_yticks(yticks)
+    ax.set_yticklabels([f'{y:.1f}' for y in yticks], fontsize=14)
+
+    ax.set_xlim(0.5, 12.5)
+    ax.grid(True, alpha=0.3, axis='y')
+
+    legend_elements = [
+        Patch(facecolor=colors['Raw'], alpha=0.7, label='NWM'),
+        Patch(facecolor=colors['DA'], alpha=0.7, label='KF+MMW')
+    ]
+    ax.legend(handles=legend_elements, loc='best', fontsize=16)
+    plt.tight_layout()
+    
+    return fig
